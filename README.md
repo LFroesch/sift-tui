@@ -4,6 +4,8 @@ Terminal TUI for [sift](../sift/) — browse and read RSS feeds from the same Po
 
 ## Quick Install
 
+Supported platforms: Linux and macOS. On Windows, use WSL.
+
 Recommended (installs to `~/.local/bin`):
 
 ```bash
