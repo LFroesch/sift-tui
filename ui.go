@@ -1,18 +1,14 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
-
-// ===== Styles (matches sb palette) =====
 
 var (
 	colorPrimary = lipgloss.Color("#5AF78E")
@@ -28,31 +24,21 @@ var (
 	yellowStyle = lipgloss.NewStyle().Foreground(colorYellow)
 )
 
-// ===== View states =====
-
 type viewState int
 
 const (
 	viewFeeds viewState = iota
 	viewPosts
 	viewDetail
-	viewAddFeed
 	viewUnread
 )
 
-// ===== Async messages =====
-
-type feedAddedMsg struct {
-	feed *Feed
-	err  error
+type feedsReloadedMsg struct {
+	feeds    []Feed
+	newPosts int
+	fetched  bool
+	err      error
 }
-
-type feedRefreshedMsg struct {
-	feedID string
-	err    error
-}
-
-// ===== Model =====
 
 type RootModel struct {
 	view         viewState
@@ -63,7 +49,6 @@ type RootModel struct {
 	selectedPost int
 	width        int
 	height       int
-	input        textinput.Model
 	vp           viewport.Model
 	vpReady      bool
 	postsOffset  int
@@ -73,30 +58,20 @@ type RootModel struct {
 	lastMsgTime  time.Time
 	feedRepo     *FeedRepository
 	postRepo     *PostRepository
-	fetcher      *FeedFetcher
 }
 
-func NewRootModel(feedRepo *FeedRepository, postRepo *PostRepository, fetcher *FeedFetcher) *RootModel {
-	ti := textinput.New()
-	ti.Placeholder = "https://example.com/feed.xml"
-	ti.Width = 60
-
+func NewRootModel(feedRepo *FeedRepository, postRepo *PostRepository) *RootModel {
 	feeds, _ := feedRepo.GetAllFeeds()
-
 	return &RootModel{
 		view:       viewFeeds,
 		feeds:      feeds,
 		postsLimit: 50,
 		feedRepo:   feedRepo,
 		postRepo:   postRepo,
-		fetcher:    fetcher,
-		input:      ti,
 	}
 }
 
 func (m RootModel) Init() tea.Cmd { return nil }
-
-// ===== Update =====
 
 func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
@@ -109,24 +84,30 @@ func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
-	case feedAddedMsg:
+	case feedsReloadedMsg:
 		if msg.err != nil {
 			m.setError(msg.err.Error())
-		} else {
-			m.feeds = append(m.feeds, *msg.feed)
-			m.setStatus("Added: " + msg.feed.Name)
+			return m, nil
 		}
-		return m, nil
-
-	case feedRefreshedMsg:
-		if msg.err != nil {
-			m.setError(msg.err.Error())
-		} else {
-			m.setStatus("Refreshed")
-			if m.view == viewPosts && len(m.feeds) > 0 &&
-				m.feeds[m.selectedFeed].ID == msg.feedID {
-				m.loadPosts()
+		m.feeds = msg.feeds
+		if m.selectedFeed >= len(m.feeds) && len(m.feeds) > 0 {
+			m.selectedFeed = len(m.feeds) - 1
+		}
+		if len(m.feeds) == 0 {
+			m.selectedFeed = 0
+			m.posts = nil
+		}
+		if msg.fetched {
+			if msg.newPosts > 0 {
+				m.setStatus(fmt.Sprintf("Fetched +%d new", msg.newPosts))
+			} else {
+				m.setStatus("Fetched: up to date")
 			}
+		} else {
+			m.setStatus("Refreshed feeds")
+		}
+		if m.view == viewPosts {
+			m.loadPosts()
 		}
 		return m, nil
 
@@ -134,13 +115,7 @@ func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleKey(msg)
 	}
 
-	// Forward non-key events to active component
-	switch m.view {
-	case viewAddFeed:
-		var cmd tea.Cmd
-		m.input, cmd = m.input.Update(msg)
-		return m, cmd
-	case viewDetail:
+	if m.view == viewDetail {
 		var cmd tea.Cmd
 		m.vp, cmd = m.vp.Update(msg)
 		return m, cmd
@@ -159,8 +134,6 @@ func (m RootModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handlePostKeys(msg)
 	case viewDetail:
 		return m.handleDetailKeys(msg)
-	case viewAddFeed:
-		return m.handleAddFeedKeys(msg)
 	}
 	return m, nil
 }
@@ -184,24 +157,11 @@ func (m RootModel) handleFeedKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.selectedPost = 0
 			m.loadPosts()
 		}
-	case "a":
-		m.view = viewAddFeed
-		m.input.SetValue("")
-		return m, m.input.Focus()
 	case "r":
-		if len(m.feeds) > 0 {
-			return m, m.refreshCmd(m.feeds[m.selectedFeed])
-		}
-	case "d":
-		if len(m.feeds) > 0 {
-			id := m.feeds[m.selectedFeed].ID
-			m.feedRepo.DeleteFeed(id)
-			m.feeds = append(m.feeds[:m.selectedFeed], m.feeds[m.selectedFeed+1:]...)
-			if m.selectedFeed >= len(m.feeds) && m.selectedFeed > 0 {
-				m.selectedFeed--
-			}
-			m.setStatus("Feed deleted")
-		}
+		return m, m.reloadFeedsCmd()
+	case "f":
+		m.setStatus("Fetching feeds…")
+		return m, m.fetchAllCmd()
 	case "n":
 		m.view = viewUnread
 		m.selectedPost = 0
@@ -230,20 +190,28 @@ func (m RootModel) handlePostKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "m":
 		if len(m.posts) > 0 {
 			p := m.posts[m.selectedPost]
-			m.postRepo.MarkAsRead(p.ID, !p.IsRead)
+			if err := m.postRepo.MarkAsRead(p.ID, !p.IsRead); err != nil {
+				m.setError(err.Error())
+				return m, nil
+			}
 			m.posts[m.selectedPost].IsRead = !p.IsRead
 		}
 	case "b":
 		if len(m.posts) > 0 {
 			p := m.posts[m.selectedPost]
-			m.postRepo.MarkAsBookmarked(p.ID, !p.IsBookmarked)
+			if err := m.postRepo.MarkAsBookmarked(p.ID, !p.IsBookmarked); err != nil {
+				m.setError(err.Error())
+				return m, nil
+			}
 			m.posts[m.selectedPost].IsBookmarked = !p.IsBookmarked
 		}
 	case "l", "right":
-		m.postsOffset += m.postsLimit
-		m.loadPosts()
+		if m.view == viewPosts {
+			m.postsOffset += m.postsLimit
+			m.loadPosts()
+		}
 	case "h", "left":
-		if m.postsOffset >= m.postsLimit {
+		if m.view == viewPosts && m.postsOffset >= m.postsLimit {
 			m.postsOffset -= m.postsLimit
 			m.loadPosts()
 		}
@@ -262,61 +230,44 @@ func (m RootModel) handleDetailKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-func (m RootModel) handleAddFeedKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "esc":
-		m.view = viewFeeds
-		return m, nil
-	case "enter":
-		url := strings.TrimSpace(m.input.Value())
-		if url != "" {
-			m.input.SetValue("")
-			m.view = viewFeeds
-			m.setStatus("Fetching…")
-			return m, m.addFeedCmd(url)
+func (m RootModel) reloadFeedsCmd() tea.Cmd {
+	return func() tea.Msg {
+		feeds, err := m.feedRepo.GetAllFeeds()
+		return feedsReloadedMsg{feeds: feeds, fetched: false, err: err}
+	}
+}
+
+func (m RootModel) fetchAllCmd() tea.Cmd {
+	return func() tea.Msg {
+		newPosts, err := m.feedRepo.FetchAllFeeds()
+		if err != nil {
+			return feedsReloadedMsg{err: err, fetched: true}
 		}
-	default:
-		var cmd tea.Cmd
-		m.input, cmd = m.input.Update(msg)
-		return m, cmd
-	}
-	return m, nil
-}
-
-// ===== Commands =====
-
-func (m RootModel) addFeedCmd(url string) tea.Cmd {
-	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		feed, err := m.fetcher.FetchAndAddFeed(ctx, url, m.postRepo)
-		return feedAddedMsg{feed, err}
+		feeds, err := m.feedRepo.GetAllFeeds()
+		return feedsReloadedMsg{feeds: feeds, newPosts: newPosts, fetched: true, err: err}
 	}
 }
-
-func (m RootModel) refreshCmd(feed Feed) tea.Cmd {
-	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		err := m.fetcher.RefreshFeed(ctx, &feed, m.postRepo)
-		return feedRefreshedMsg{feed.ID, err}
-	}
-}
-
-// ===== Helpers =====
 
 func (m *RootModel) loadPosts() {
 	if len(m.feeds) == 0 {
 		m.posts = nil
 		return
 	}
-	posts, _ := m.postRepo.GetPostsByFeedID(
+	posts, err := m.postRepo.GetPostsByFeedID(
 		m.feeds[m.selectedFeed].ID, m.postsLimit, m.postsOffset)
+	if err != nil {
+		m.setError(err.Error())
+		return
+	}
 	m.posts = posts
 }
 
 func (m *RootModel) loadUnread() {
-	posts, _ := m.postRepo.GetAllUnread()
+	posts, err := m.postRepo.GetAllUnread()
+	if err != nil {
+		m.setError(err.Error())
+		return
+	}
 	m.posts = posts
 }
 
@@ -326,8 +277,11 @@ func (m *RootModel) openDetail() {
 	}
 	m.prevView = m.view
 	p := m.posts[m.selectedPost]
-	m.postRepo.MarkAsRead(p.ID, true)
-	m.posts[m.selectedPost].IsRead = true
+	if err := m.postRepo.MarkAsRead(p.ID, true); err != nil {
+		m.setError(err.Error())
+	} else {
+		m.posts[m.selectedPost].IsRead = true
+	}
 
 	var sb strings.Builder
 	sb.WriteString(titleStyle.Render(p.Title))
@@ -366,8 +320,6 @@ func (m *RootModel) setError(msg string) {
 	m.lastMsgTime = time.Now()
 }
 
-// ===== View =====
-
 func (m RootModel) View() string {
 	switch m.view {
 	case viewFeeds:
@@ -376,8 +328,6 @@ func (m RootModel) View() string {
 		return m.viewPosts()
 	case viewDetail:
 		return m.viewDetail()
-	case viewAddFeed:
-		return m.viewAddFeed()
 	case viewUnread:
 		return m.viewUnread()
 	}
@@ -386,28 +336,28 @@ func (m RootModel) View() string {
 
 func (m RootModel) viewFeeds() string {
 	var lines []string
-	lines = append(lines, titleStyle.Render("sift — RSS Feeds"))
+	lines = append(lines, titleStyle.Render("sift — Feeds"))
+	lines = append(lines, dimStyle.Render("API mode"))
 	lines = append(lines, "")
 
 	if len(m.feeds) == 0 {
-		lines = append(lines, dimStyle.Render("  No feeds yet. Press 'a' to add one."))
+		lines = append(lines, dimStyle.Render("  No feeds yet. Add feeds in sift web UI."))
 	}
 
 	for i, feed := range m.feeds {
-		unread, _ := m.postRepo.GetUnreadCount(feed.ID)
 		cursor := "  "
 		if i == m.selectedFeed {
 			cursor = accentStyle.Render("▶ ")
 		}
-		unreadStr := ""
-		if unread > 0 {
-			unreadStr = " " + yellowStyle.Render(fmt.Sprintf("(%d)", unread))
+		groupSuffix := ""
+		if len(feed.Groups) > 0 {
+			groupSuffix = dimStyle.Render(fmt.Sprintf(" [%d groups]", len(feed.Groups)))
 		}
-		lines = append(lines, fmt.Sprintf("%s%s%s", cursor, truncate(feed.Name, 50), unreadStr))
+		lines = append(lines, fmt.Sprintf("%s%s%s", cursor, truncate(feed.Name, 64), groupSuffix))
 	}
 
 	lines = append(lines, "")
-	lines = append(lines, m.footer("a:add  r:refresh  d:delete  n:unread  enter:open  q:quit"))
+	lines = append(lines, m.footer("r:reload  f:fetch-all  n:unread  enter:open  q:quit"))
 	return strings.Join(lines, "\n")
 }
 
@@ -422,7 +372,7 @@ func (m RootModel) viewPosts() string {
 	lines = append(lines, "")
 
 	if len(m.posts) == 0 {
-		lines = append(lines, dimStyle.Render("  No posts yet. Press 'r' to refresh this feed."))
+		lines = append(lines, dimStyle.Render("  No posts found for this feed."))
 	}
 
 	for i, p := range m.posts {
@@ -461,17 +411,6 @@ func (m RootModel) viewDetail() string {
 	return m.vp.View() + "\n" + m.footer("j/k:scroll  esc:back")
 }
 
-func (m RootModel) viewAddFeed() string {
-	return strings.Join([]string{
-		titleStyle.Render("sift — Add Feed"),
-		"",
-		"Feed URL:",
-		m.input.View(),
-		"",
-		m.footer("enter:add  esc:cancel"),
-	}, "\n")
-}
-
 func (m RootModel) viewUnread() string {
 	var lines []string
 	lines = append(lines, titleStyle.Render(fmt.Sprintf("sift — Unread (%d)", len(m.posts))))
@@ -503,8 +442,6 @@ func (m RootModel) viewUnread() string {
 	lines = append(lines, m.footer("m:read  b:bookmark  enter:open  esc:back"))
 	return strings.Join(lines, "\n")
 }
-
-// ===== Render helpers =====
 
 func (m RootModel) footer(keys string) string {
 	status := ""
@@ -548,7 +485,6 @@ func stripHTML(s string) string {
 			out.WriteRune(c)
 		}
 	}
-	// Collapse multiple spaces/newlines
 	result := strings.TrimSpace(out.String())
 	for strings.Contains(result, "  ") {
 		result = strings.ReplaceAll(result, "  ", " ")

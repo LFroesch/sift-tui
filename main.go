@@ -2,30 +2,27 @@ package main
 
 import (
 	"fmt"
-	"log"
 	"os"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
 
 func main() {
-	dbURL := os.Getenv("DATABASE_URL")
-	if dbURL == "" {
-		dbURL = "postgres://postgres:postgres@localhost:5432/sift?sslmode=disable"
+	apiURL := os.Getenv("SIFT_API_URL")
+	if apiURL == "" {
+		apiURL = "http://localhost:5005"
+	}
+	apiURL = strings.TrimRight(apiURL, "/")
+	if !strings.HasSuffix(apiURL, "/api") {
+		apiURL += "/api"
 	}
 
-	db, err := NewDB(dbURL)
-	if err != nil {
-		log.Fatalf("sift-tui: connect db: %v", err)
-	}
-	defer db.Close()
+	client := NewAPIClient(apiURL)
+	feedRepo := NewFeedRepository(client)
+	postRepo := NewPostRepository(client)
 
-	feedRepo := NewFeedRepository(db)
-	postRepo := NewPostRepository(db)
-	fetcher := NewFeedFetcher(feedRepo)
-
-	m := NewRootModel(feedRepo, postRepo, fetcher)
-
+	m := NewRootModel(feedRepo, postRepo)
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "sift-tui: %v\n", err)

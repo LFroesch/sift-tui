@@ -1,151 +1,226 @@
 package main
 
 import (
-	"database/sql"
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
 	"time"
 )
 
+type APIClient struct {
+	baseURL string
+	http    *http.Client
+}
+
+func NewAPIClient(baseURL string) *APIClient {
+	return &APIClient{
+		baseURL: strings.TrimRight(baseURL, "/"),
+		http:    &http.Client{Timeout: 20 * time.Second},
+	}
+}
+
+type apiError struct {
+	Error string `json:"error"`
+}
+
+func (c *APIClient) doJSON(method, path string, query url.Values, body any, out any) error {
+	u := c.baseURL + path
+	if len(query) > 0 {
+		u += "?" + query.Encode()
+	}
+
+	var reader io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			return err
+		}
+		reader = bytes.NewReader(b)
+	}
+
+	req, err := http.NewRequest(method, u, reader)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "application/json")
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		var apiErr apiError
+		_ = json.NewDecoder(resp.Body).Decode(&apiErr)
+		if apiErr.Error != "" {
+			return fmt.Errorf("api %s %s: %s", method, path, apiErr.Error)
+		}
+		return fmt.Errorf("api %s %s: status %d", method, path, resp.StatusCode)
+	}
+
+	if out == nil {
+		return nil
+	}
+	return json.NewDecoder(resp.Body).Decode(out)
+}
+
 // ===== Types =====
 
+type Group struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
 type Feed struct {
-	ID            string
-	Name          string
-	URL           string
-	LastFetchedAt *time.Time
+	ID            string     `json:"id"`
+	Name          string     `json:"name"`
+	URL           string     `json:"url"`
+	LastFetchedAt *time.Time `json:"last_fetched_at"`
+	Groups        []Group    `json:"groups"`
 }
 
 type Post struct {
-	ID           string
-	FeedID       string
-	Title        string
-	URL          string
-	Description  string
-	PublishedAt  *time.Time
-	IsRead       bool
-	IsBookmarked bool
+	ID           string     `json:"id"`
+	FeedID       string     `json:"feed_id"`
+	FeedName     string     `json:"feed_name"`
+	Title        string     `json:"title"`
+	URL          string     `json:"url"`
+	Description  string     `json:"description"`
+	PublishedAt  *time.Time `json:"published_at"`
+	IsRead       bool       `json:"is_read"`
+	IsBookmarked bool       `json:"is_bookmarked"`
+}
+
+type postsResponse struct {
+	Posts   []Post `json:"posts"`
+	HasMore bool   `json:"hasMore"`
+}
+
+type fetchResponse struct {
+	NewPosts int `json:"newPosts"`
 }
 
 // ===== FeedRepository =====
 
-type FeedRepository struct{ db *DB }
+type FeedRepository struct{ api *APIClient }
 
-func NewFeedRepository(db *DB) *FeedRepository { return &FeedRepository{db} }
+func NewFeedRepository(api *APIClient) *FeedRepository { return &FeedRepository{api: api} }
 
 func (r *FeedRepository) GetAllFeeds() ([]Feed, error) {
-	rows, err := r.db.Query(
-		`SELECT id, name, url, last_fetched_at FROM feeds ORDER BY name`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
 	var feeds []Feed
-	for rows.Next() {
-		var f Feed
-		if err := rows.Scan(&f.ID, &f.Name, &f.URL, &f.LastFetchedAt); err != nil {
-			return nil, err
-		}
-		feeds = append(feeds, f)
-	}
-	return feeds, rows.Err()
+	err := r.api.doJSON(http.MethodGet, "/feeds", nil, nil, &feeds)
+	return feeds, err
 }
 
-func (r *FeedRepository) CreateFeed(name, url string) (*Feed, error) {
-	var f Feed
-	err := r.db.QueryRow(
-		`INSERT INTO feeds (name, url) VALUES ($1, $2)
-		 RETURNING id, name, url, last_fetched_at`,
-		name, url,
-	).Scan(&f.ID, &f.Name, &f.URL, &f.LastFetchedAt)
-	return &f, err
+func (r *FeedRepository) FetchAllFeeds() (int, error) {
+	var resp fetchResponse
+	err := r.api.doJSON(http.MethodPost, "/fetch", nil, nil, &resp)
+	return resp.NewPosts, err
 }
 
-func (r *FeedRepository) DeleteFeed(id string) error {
-	_, err := r.db.Exec(`DELETE FROM feeds WHERE id = $1`, id)
-	return err
+// Legacy methods kept so old helpers compile.
+func (r *FeedRepository) CreateFeed(_, _ string) (*Feed, error) {
+	return nil, fmt.Errorf("not supported in read mode")
 }
 
-func (r *FeedRepository) UpdateLastFetched(id string) error {
-	_, err := r.db.Exec(
-		`UPDATE feeds SET last_fetched_at = NOW(), updated_at = NOW() WHERE id = $1`, id)
-	return err
+func (r *FeedRepository) DeleteFeed(_ string) error {
+	return fmt.Errorf("not supported in read mode")
 }
+
+func (r *FeedRepository) UpdateLastFetched(_ string) error { return nil }
 
 // ===== PostRepository =====
 
-type PostRepository struct{ db *DB }
+type PostRepository struct{ api *APIClient }
 
-func NewPostRepository(db *DB) *PostRepository { return &PostRepository{db} }
+func NewPostRepository(api *APIClient) *PostRepository { return &PostRepository{api: api} }
 
 func (r *PostRepository) GetPostsByFeedID(feedID string, limit, offset int) ([]Post, error) {
-	rows, err := r.db.Query(
-		`SELECT id, feed_id, title, url, COALESCE(description, ''), published_at, is_read, is_bookmarked
-		 FROM posts WHERE feed_id = $1
-		 ORDER BY COALESCE(published_at, created_at) DESC
-		 LIMIT $2 OFFSET $3`,
-		feedID, limit, offset,
-	)
-	if err != nil {
+	q := url.Values{}
+	q.Set("feed_id", feedID)
+	q.Set("limit", strconv.Itoa(limit))
+	q.Set("offset", strconv.Itoa(offset))
+
+	var resp postsResponse
+	if err := r.api.doJSON(http.MethodGet, "/posts", q, nil, &resp); err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	return scanPosts(rows)
+	return normalizePosts(resp.Posts), nil
 }
 
 func (r *PostRepository) GetAllUnread() ([]Post, error) {
-	rows, err := r.db.Query(
-		`SELECT id, feed_id, title, url, COALESCE(description, ''), published_at, is_read, is_bookmarked
-		 FROM posts WHERE is_read = FALSE
-		 ORDER BY COALESCE(published_at, created_at) DESC`)
-	if err != nil {
-		return nil, err
+	limit := 200
+	offset := 0
+	var out []Post
+
+	for {
+		q := url.Values{}
+		q.Set("limit", strconv.Itoa(limit))
+		q.Set("offset", strconv.Itoa(offset))
+
+		var resp postsResponse
+		if err := r.api.doJSON(http.MethodGet, "/posts", q, nil, &resp); err != nil {
+			return nil, err
+		}
+
+		for _, p := range normalizePosts(resp.Posts) {
+			if !p.IsRead {
+				out = append(out, p)
+			}
+		}
+
+		if !resp.HasMore || len(resp.Posts) == 0 || offset > 5000 {
+			break
+		}
+		offset += limit
 	}
-	defer rows.Close()
-	return scanPosts(rows)
+	return out, nil
 }
 
 func (r *PostRepository) MarkAsRead(id string, isRead bool) error {
-	_, err := r.db.Exec(
-		`UPDATE posts SET is_read = $1, updated_at = NOW() WHERE id = $2`, isRead, id)
-	return err
+	path := "/posts/" + id + "/read"
+	if !isRead {
+		path = "/posts/" + id + "/unread"
+	}
+	return r.api.doJSON(http.MethodPatch, path, nil, nil, nil)
 }
 
-func (r *PostRepository) MarkAsBookmarked(id string, isBookmarked bool) error {
-	_, err := r.db.Exec(
-		`UPDATE posts SET is_bookmarked = $1, updated_at = NOW() WHERE id = $2`, isBookmarked, id)
-	return err
+func (r *PostRepository) MarkAsBookmarked(id string, _ bool) error {
+	path := "/posts/" + id + "/bookmark"
+	return r.api.doJSON(http.MethodPatch, path, nil, nil, nil)
 }
 
 func (r *PostRepository) GetUnreadCount(feedID string) (int, error) {
-	var count int
-	err := r.db.QueryRow(
-		`SELECT COUNT(*) FROM posts WHERE feed_id = $1 AND is_read = FALSE`, feedID,
-	).Scan(&count)
-	return count, err
-}
-
-func (r *PostRepository) UpsertPost(p *Post) error {
-	desc := sql.NullString{}
-	if p.Description != "" {
-		desc = sql.NullString{String: p.Description, Valid: true}
+	posts, err := r.GetPostsByFeedID(feedID, 200, 0)
+	if err != nil {
+		return 0, err
 	}
-	_, err := r.db.Exec(
-		`INSERT INTO posts (title, url, description, published_at, feed_id, is_read, is_bookmarked)
-		 VALUES ($1, $2, $3, $4, $5, FALSE, FALSE)
-		 ON CONFLICT (url) DO NOTHING`,
-		p.Title, p.URL, desc, p.PublishedAt, p.FeedID,
-	)
-	return err
-}
-
-func scanPosts(rows *sql.Rows) ([]Post, error) {
-	var posts []Post
-	for rows.Next() {
-		var p Post
-		if err := rows.Scan(&p.ID, &p.FeedID, &p.Title, &p.URL, &p.Description,
-			&p.PublishedAt, &p.IsRead, &p.IsBookmarked); err != nil {
-			return nil, err
+	count := 0
+	for _, p := range posts {
+		if !p.IsRead {
+			count++
 		}
-		posts = append(posts, p)
 	}
-	return posts, rows.Err()
+	return count, nil
+}
+
+// Legacy method kept so old helpers compile.
+func (r *PostRepository) UpsertPost(_ *Post) error { return nil }
+
+func normalizePosts(posts []Post) []Post {
+	for i := range posts {
+		if posts[i].Description == "null" {
+			posts[i].Description = ""
+		}
+	}
+	return posts
 }
