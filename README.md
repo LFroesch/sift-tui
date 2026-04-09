@@ -25,6 +25,7 @@ Command:
 ```bash
 sift-tui
 ```
+
 ## Setup
 
 Requires sift's DB to be running. Default connection: `postgres://postgres:postgres@localhost:5432/sift`
@@ -60,3 +61,7 @@ DATABASE_URL="postgres://..." ./sift-tui
 - [Bubble Tea](https://github.com/charmbracelet/bubbletea) + Lipgloss
 - PostgreSQL via `lib/pq` (shared with sift)
 - [gofeed](https://github.com/mmcdole/gofeed) for RSS/Atom parsing
+
+## License
+
+[AGPL-3.0](LICENSE)
